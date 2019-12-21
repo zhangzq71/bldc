@@ -1,5 +1,5 @@
 /*
-	Copyright 2016 Benjamin Vedder	benjamin@vedder.se
+	Copyright 2016 - 2019 Benjamin Vedder	benjamin@vedder.se
 
 	This file is part of the VESC firmware.
 
@@ -24,9 +24,16 @@
 #include "nrf_driver.h"
 #include "rfhelp.h"
 #include "comm_can.h"
+#include "imu.h"
 
 // Private variables
 static app_configuration appconf;
+static virtual_timer_t output_vt;
+static bool output_vt_init_done = false;
+static volatile bool output_disabled_now = false;
+
+// Private functions
+static void output_vt_cb(void *arg);
 
 const app_configuration* app_get_configuration(void) {
 	return &appconf;
@@ -45,6 +52,7 @@ void app_set_configuration(app_configuration *conf) {
 	app_adc_stop();
 	app_uartcomm_stop();
 	app_nunchuk_stop();
+	app_balance_stop();
 
 	if (!conf_general_permanent_nrf_found) {
 		nrf_driver_stop();
@@ -57,6 +65,11 @@ void app_set_configuration(app_configuration *conf) {
 #ifdef APP_CUSTOM_TO_USE
 	app_custom_stop();
 #endif
+
+	imu_init(&conf->imu_conf);
+
+	// Configure balance app before starting it.
+	app_balance_configure(&appconf.app_balance_conf, &appconf.imu_conf);
 
 	switch (appconf.app_to_use) {
 	case APP_PPM:
@@ -88,6 +101,14 @@ void app_set_configuration(app_configuration *conf) {
 		app_nunchuk_start();
 		break;
 
+	case APP_BALANCE:
+		app_balance_start();
+		if(appconf.imu_conf.type == IMU_TYPE_INTERNAL){
+			hw_stop_i2c();
+			app_uartcomm_start();
+		}
+		break;
+
 	case APP_NRF:
 		if (!conf_general_permanent_nrf_found) {
 			nrf_driver_init();
@@ -108,7 +129,7 @@ void app_set_configuration(app_configuration *conf) {
 
 	app_ppm_configure(&appconf.app_ppm_conf);
 	app_adc_configure(&appconf.app_adc_conf);
-	app_uartcomm_configure(appconf.app_uart_baudrate);
+	app_uartcomm_configure(appconf.app_uart_baudrate, appconf.permanent_uart_enabled);
 	app_nunchuk_configure(&appconf.app_chuk_conf);
 
 #ifdef APP_CUSTOM_TO_USE
@@ -116,4 +137,39 @@ void app_set_configuration(app_configuration *conf) {
 #endif
 
 	rfhelp_update_conf(&appconf.app_nrf_conf);
+}
+
+/**
+ * Disable output on apps
+ *
+ * @param time_ms
+ * The amount of time to disable output in ms
+ * 0: Enable output now
+ * -1: Disable forever
+ * >0: Amount of milliseconds to disable output
+ */
+void app_disable_output(int time_ms) {
+	if (!output_vt_init_done) {
+		chVTObjectInit(&output_vt);
+		output_vt_init_done = true;
+	}
+
+	if (time_ms == 0) {
+		output_disabled_now = false;
+	} else if (time_ms == -1) {
+		output_disabled_now = true;
+		chVTReset(&output_vt);
+	} else {
+		output_disabled_now = true;
+		chVTSet(&output_vt, MS2ST(time_ms), output_vt_cb, 0);
+	}
+}
+
+bool app_is_output_disabled(void) {
+	return output_disabled_now;
+}
+
+static void output_vt_cb(void *arg) {
+	(void)arg;
+	output_disabled_now = false;
 }

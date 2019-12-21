@@ -22,11 +22,18 @@
 #include "hal.h"
 #include "stm32f4xx_conf.h"
 #include "hw.h"
+#include "mc_interface.h"
 #include "utils.h"
+#include "math.h"
 
 // Defines
 #define AS5047P_READ_ANGLECOM		(0x3FFF | 0x4000 | 0x8000) // This is just ones
 #define AS5047_SAMPLE_RATE_HZ		20000
+#define AD2S1205_SAMPLE_RATE_HZ		20000		//25MHz max spi clk
+#define SINCOS_SAMPLE_RATE_HZ		20000
+#define SINCOS_MIN_AMPLITUDE		1.0			// sqrt(sin^2 + cos^2) has to be larger than this
+#define SINCOS_MAX_AMPLITUDE		1.65		// sqrt(sin^2 + cos^2) has to be smaller than this
+
 
 #if AS5047_USE_HW_SPI_PINS
 #ifdef HW_SPI_DEV
@@ -62,7 +69,10 @@
 typedef enum {
 	ENCODER_MODE_NONE = 0,
 	ENCODER_MODE_ABI,
-	ENCODER_MODE_AS5047P_SPI
+	ENCODER_MODE_AS5047P_SPI,
+	RESOLVER_MODE_AD2S1205,
+	ENCODER_MODE_SINCOS,
+	ENCODER_MODE_TS5700N8501
 } encoder_mode;
 
 // Private variables
@@ -70,12 +80,66 @@ static bool index_found = false;
 static uint32_t enc_counts = 10000;
 static encoder_mode mode = ENCODER_MODE_NONE;
 static float last_enc_angle = 0.0;
+static uint16_t spi_val = 0;
+static uint32_t spi_error_cnt = 0;
+static float spi_error_rate = 0.0;
+
+static float sin_gain = 0.0;
+static float sin_offset = 0.0;
+static float cos_gain = 0.0;
+static float cos_offset = 0.0;
+static float sincos_filter_constant = 0.0;
+static uint32_t sincos_signal_below_min_error_cnt = 0;
+static uint32_t sincos_signal_above_max_error_cnt = 0;
+static float sincos_signal_low_error_rate = 0.0;
+static float sincos_signal_above_max_error_rate = 0.0;
+
+static SerialConfig TS5700N8501_uart_cfg = {
+		2500000,
+		0,
+		USART_CR2_LINEN,
+		0
+};
+
+static THD_FUNCTION(ts5700n8501_thread, arg);
+static THD_WORKING_AREA(ts5700n8501_thread_wa, 512);
+static volatile bool ts5700n8501_stop_now = true;
+static volatile bool ts5700n8501_is_running = false;
 
 // Private functions
 static void spi_transfer(uint16_t *in_buf, const uint16_t *out_buf, int length);
 static void spi_begin(void);
 static void spi_end(void);
 static void spi_delay(void);
+void TS5700N8501_send_byte(uint8_t b);
+
+uint32_t encoder_spi_get_error_cnt(void) {
+	return spi_error_cnt;
+}
+
+uint16_t encoder_spi_get_val(void) {
+	return spi_val;
+}
+
+float encoder_spi_get_error_rate(void) {
+	return spi_error_rate;
+}
+
+uint32_t encoder_sincos_get_signal_below_min_error_cnt(void) {
+	return sincos_signal_below_min_error_cnt;
+}
+
+uint32_t encoder_sincos_get_signal_above_max_error_cnt(void) {
+	return sincos_signal_above_max_error_cnt;
+}
+
+float encoder_sincos_get_signal_below_min_error_rate(void) {
+	return sincos_signal_low_error_rate;
+}
+
+float encoder_sincos_get_signal_above_max_error_rate(void) {
+	return sincos_signal_above_max_error_rate;
+}
 
 void encoder_deinit(void) {
 	nvicDisableVector(HW_ENC_EXTI_CH);
@@ -90,9 +154,25 @@ void encoder_deinit(void) {
 	palSetPadMode(HW_HALL_ENC_GPIO1, HW_HALL_ENC_PIN1, PAL_MODE_INPUT_PULLUP);
 	palSetPadMode(HW_HALL_ENC_GPIO2, HW_HALL_ENC_PIN2, PAL_MODE_INPUT_PULLUP);
 
+	if (mode == ENCODER_MODE_TS5700N8501) {
+		ts5700n8501_stop_now = true;
+		while (ts5700n8501_is_running) {
+			chThdSleepMilliseconds(1);
+		}
+
+		palSetPadMode(HW_UART_TX_PORT, HW_UART_TX_PIN, PAL_MODE_INPUT_PULLUP);
+		palSetPadMode(HW_UART_RX_PORT, HW_UART_RX_PIN, PAL_MODE_INPUT_PULLUP);
+#ifdef HW_ADC_EXT_GPIO
+		palSetPadMode(HW_ADC_EXT_GPIO, HW_ADC_EXT_PIN, PAL_MODE_INPUT_ANALOG);
+#endif
+	}
+
 	index_found = false;
 	mode = ENCODER_MODE_NONE;
 	last_enc_angle = 0.0;
+	spi_error_rate = 0.0;
+	sincos_signal_low_error_rate = 0.0;
+	sincos_signal_above_max_error_rate = 0.0;
 }
 
 void encoder_init_abi(uint32_t counts) {
@@ -175,12 +255,101 @@ void encoder_init_as5047p_spi(void) {
 
 	mode = ENCODER_MODE_AS5047P_SPI;
 	index_found = true;
+	spi_error_rate = 0.0;
+}
+
+void encoder_init_ad2s1205_spi(void) {
+	TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+
+	palSetPadMode(SPI_SW_MISO_GPIO, SPI_SW_MISO_PIN, PAL_MODE_INPUT);
+	palSetPadMode(SPI_SW_SCK_GPIO, SPI_SW_SCK_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
+	palSetPadMode(SPI_SW_CS_GPIO, SPI_SW_CS_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
+
+	// Set MOSI to 1
+#if AS5047_USE_HW_SPI_PINS
+	palSetPadMode(SPI_SW_MOSI_GPIO, SPI_SW_MOSI_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
+	palSetPad(SPI_SW_MOSI_GPIO, SPI_SW_MOSI_PIN);
+#endif
+
+	// TODO: Choose pins on comm port when these are not defined
+#if defined(AD2S1205_SAMPLE_GPIO) && defined(AD2S1205_RDVEL_GPIO)
+	palSetPadMode(AD2S1205_SAMPLE_GPIO, AD2S1205_SAMPLE_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
+	palSetPadMode(AD2S1205_RDVEL_GPIO, AD2S1205_RDVEL_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
+
+	palSetPad(AD2S1205_SAMPLE_GPIO, AD2S1205_SAMPLE_PIN);	// Prepare for a falling edge SAMPLE assertion
+	palSetPad(AD2S1205_RDVEL_GPIO, AD2S1205_RDVEL_PIN);		// Will always read position
+#endif
+
+
+	// Enable timer clock
+	HW_ENC_TIM_CLK_EN();
+
+	// Time Base configuration
+	TIM_TimeBaseStructure.TIM_Prescaler = 0;
+	TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+	TIM_TimeBaseStructure.TIM_Period = ((168000000 / 2 / AD2S1205_SAMPLE_RATE_HZ) - 1);
+	TIM_TimeBaseStructure.TIM_ClockDivision = 0;
+	TIM_TimeBaseStructure.TIM_RepetitionCounter = 0;
+	TIM_TimeBaseInit(HW_ENC_TIM, &TIM_TimeBaseStructure);
+
+	// Enable overflow interrupt
+	TIM_ITConfig(HW_ENC_TIM, TIM_IT_Update, ENABLE);
+
+	// Enable timer
+	TIM_Cmd(HW_ENC_TIM, ENABLE);
+
+	nvicEnableVector(HW_ENC_TIM_ISR_CH, 6);
+
+	mode = RESOLVER_MODE_AD2S1205;
+	index_found = true;
+}
+
+void encoder_init_sincos(float s_gain, float s_offset,
+						 float c_gain, float c_offset, float filter_constant) {
+	//ADC inputs are already initialized in hw_init_gpio()
+	sin_gain = s_gain;
+	sin_offset = s_offset;
+	cos_gain = c_gain;
+	cos_offset = c_offset;
+	sincos_filter_constant = filter_constant;
+
+	sincos_signal_below_min_error_cnt = 0;
+	sincos_signal_above_max_error_cnt = 0;
+	sincos_signal_low_error_rate = 0.0;
+	sincos_signal_above_max_error_rate = 0.0;
+
+	// ADC measurements needs to be in sync with motor PWM
+#ifdef HW_HAS_SIN_COS_ENCODER
+	mode = ENCODER_MODE_SINCOS;
+	index_found = true;
+#else
+	mode = ENCODER_MODE_NONE;
+	index_found = false;
+#endif
+}
+
+void encoder_init_ts5700n8501(void) {
+	mode = ENCODER_MODE_TS5700N8501;
+	index_found = true;
+	spi_error_rate = 0.0;
+	spi_error_cnt = 0;
+	ts5700n8501_is_running = true;
+	ts5700n8501_stop_now = false;
+
+	chThdCreateStatic(ts5700n8501_thread_wa, sizeof(ts5700n8501_thread_wa),
+			NORMALPRIO - 10, ts5700n8501_thread, NULL);
 }
 
 bool encoder_is_configured(void) {
 	return mode != ENCODER_MODE_NONE;
 }
 
+/**
+ * Read angle from configured encoder.
+ *
+ * @return
+ * The current encoder angle in degrees.
+ */
 float encoder_read_deg(void) {
 	static float angle = 0.0;
 
@@ -190,8 +359,42 @@ float encoder_read_deg(void) {
 		break;
 
 	case ENCODER_MODE_AS5047P_SPI:
+	case RESOLVER_MODE_AD2S1205:
+	case ENCODER_MODE_TS5700N8501:
 		angle = last_enc_angle;
 		break;
+
+#ifdef HW_HAS_SIN_COS_ENCODER
+	case ENCODER_MODE_SINCOS: {
+		float sin = ENCODER_SIN_VOLTS * sin_gain - sin_offset;
+		float cos = ENCODER_COS_VOLTS * cos_gain - cos_offset;
+
+		float module = SQ(sin) + SQ(cos);
+
+		if (module > SQ(SINCOS_MAX_AMPLITUDE) )	{
+			// signals vector outside of the valid area. Increase error count and discard measurement
+			++sincos_signal_above_max_error_cnt;
+			UTILS_LP_FAST(sincos_signal_above_max_error_rate, 1.0, 1./SINCOS_SAMPLE_RATE_HZ);
+			angle = last_enc_angle;
+		}
+		else {
+			if (module < SQ(SINCOS_MIN_AMPLITUDE)) {
+				++sincos_signal_below_min_error_cnt;
+				UTILS_LP_FAST(sincos_signal_low_error_rate, 1.0, 1./SINCOS_SAMPLE_RATE_HZ);
+				angle = last_enc_angle;
+			}
+			else {
+				UTILS_LP_FAST(sincos_signal_above_max_error_rate, 0.0, 1./SINCOS_SAMPLE_RATE_HZ);
+				UTILS_LP_FAST(sincos_signal_low_error_rate, 0.0, 1./SINCOS_SAMPLE_RATE_HZ);
+
+				float angle_tmp = utils_fast_atan2(sin, cos) * 180.0 / M_PI;
+				UTILS_LP_FAST(angle, angle_tmp, sincos_filter_constant);
+				last_enc_angle = angle;
+			}
+		}
+		break;
+	}
+#endif
 
 	default:
 		break;
@@ -235,18 +438,61 @@ void encoder_reset(void) {
 	}
 }
 
+// returns true for even number of ones (no parity error according to AS5047 datasheet
+bool spi_check_parity(uint16_t x) {
+	x ^= x >> 8;
+	x ^= x >> 4;
+	x ^= x >> 2;
+	x ^= x >> 1;
+	return (~x) & 1;
+}
+
 /**
  * Timer interrupt
  */
 void encoder_tim_isr(void) {
 	uint16_t pos;
 
-	spi_begin();
-	spi_transfer(&pos, 0, 1);
-	spi_end();
+	if(mode == ENCODER_MODE_AS5047P_SPI) {
+		spi_begin();
+		spi_transfer(&pos, 0, 1);
+		spi_end();
 
-	pos &= 0x3FFF;
-	last_enc_angle = ((float)pos * 360.0) / 16384.0;
+		spi_val = pos;
+		if(spi_check_parity(pos) && pos != 0xffff) {  // all ones = disconnect
+			pos &= 0x3FFF;
+			last_enc_angle = ((float)pos * 360.0) / 16384.0;
+			UTILS_LP_FAST(spi_error_rate, 0.0, 1./AS5047_SAMPLE_RATE_HZ);
+		} else {
+			++spi_error_cnt;
+			UTILS_LP_FAST(spi_error_rate, 1.0, 1./AS5047_SAMPLE_RATE_HZ);
+		}		
+	}
+
+	if(mode == RESOLVER_MODE_AD2S1205) {
+		// SAMPLE signal should have been be asserted in sync with ADC sampling
+#ifdef AD2S1205_RDVEL_GPIO
+		palSetPad(AD2S1205_RDVEL_GPIO, AD2S1205_RDVEL_PIN);	// Always read position
+#endif
+
+		spi_begin(); // CS uses the same mcu pin as AS5047
+
+		spi_transfer(&pos, 0, 1);
+		spi_end();
+
+		uint16_t RDVEL = pos & 0x08; // 1 means a position read
+		uint16_t DOS = pos & 0x04;
+		uint16_t LOT = pos & 0x02;
+	//	uint16_t parity = pos & 0x01; // 16 bit frame should have odd parity
+
+		pos &= 0xFFF0;
+		pos = pos >> 4;
+		pos &= 0x0FFF; // check if needed
+
+		if((RDVEL != 0) && (DOS != 0) && (LOT != 0)) {
+			last_enc_angle = ((float)pos * 360.0) / 4096.0;
+		}
+	}
 }
 
 /**
@@ -283,19 +529,22 @@ static void spi_transfer(uint16_t *in_buf, const uint16_t *out_buf, int length) 
 			//palWritePad(HW_SPI_PORT_MOSI, HW_SPI_PIN_MOSI, send >> 15);
 			send <<= 1;
 
-			spi_delay();
 			palSetPad(SPI_SW_SCK_GPIO, SPI_SW_SCK_PIN);
 			spi_delay();
 
-			int r1, r2, r3;
-			r1 = palReadPad(SPI_SW_MISO_GPIO, SPI_SW_MISO_PIN);
+			int samples = 0;
+			samples += palReadPad(SPI_SW_MISO_GPIO, SPI_SW_MISO_PIN);
 			__NOP();
-			r2 = palReadPad(SPI_SW_MISO_GPIO, SPI_SW_MISO_PIN);
+			samples += palReadPad(SPI_SW_MISO_GPIO, SPI_SW_MISO_PIN);
 			__NOP();
-			r3 = palReadPad(SPI_SW_MISO_GPIO, SPI_SW_MISO_PIN);
+			samples += palReadPad(SPI_SW_MISO_GPIO, SPI_SW_MISO_PIN);
+			__NOP();
+			samples += palReadPad(SPI_SW_MISO_GPIO, SPI_SW_MISO_PIN);
+			__NOP();
+			samples += palReadPad(SPI_SW_MISO_GPIO, SPI_SW_MISO_PIN);
 
 			recieve <<= 1;
-			if (utils_middle_of_3_int(r1, r2, r3)) {
+			if (samples > 2) {
 				recieve |= 1;
 			}
 
@@ -323,3 +572,112 @@ static void spi_delay(void) {
 	__NOP();
 	__NOP();
 }
+
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+
+void TS5700N8501_delay_uart(void) {
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP();
+}
+
+/*
+ * It is important to switch to receive mode immediately after sending the readout command,
+ * as the TS5700N8501 starts sending the reply after 3 microseconds. Therefore use software
+ * UART on TX so that the enable signal can be controlled manually. This function runs while
+ * the system is locked, but it should finish fast enough to not cause problems for other
+ * things due to the high baud rate.
+ */
+void TS5700N8501_send_byte(uint8_t b) {
+	utils_sys_lock_cnt();
+#ifdef HW_ADC_EXT_GPIO
+	palSetPad(HW_ADC_EXT_GPIO, HW_ADC_EXT_PIN);
+#endif
+	TS5700N8501_delay_uart();
+	palWritePad(HW_UART_TX_PORT, HW_UART_TX_PIN, 0);
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	for (int i = 0;i < 8;i++) {
+		palWritePad(HW_UART_TX_PORT, HW_UART_TX_PIN,
+				(b & (0x80 >> i)) ? PAL_HIGH : PAL_LOW);
+		TS5700N8501_delay_uart();
+	}
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	__NOP(); __NOP(); __NOP();
+	palWritePad(HW_UART_TX_PORT, HW_UART_TX_PIN, 1);
+	TS5700N8501_delay_uart();
+#ifdef HW_ADC_EXT_GPIO
+	palClearPad(HW_ADC_EXT_GPIO, HW_ADC_EXT_PIN);
+#endif
+	utils_sys_unlock_cnt();
+}
+
+#pragma GCC pop_options
+
+static THD_FUNCTION(ts5700n8501_thread, arg) {
+	(void)arg;
+
+	chRegSetThreadName("TS5700N8501");
+
+	sdStart(&HW_UART_DEV, &TS5700N8501_uart_cfg);
+	palSetPadMode(HW_UART_TX_PORT, HW_UART_TX_PIN, PAL_MODE_OUTPUT_PUSHPULL |
+			PAL_STM32_OSPEED_HIGHEST |
+			PAL_STM32_PUDR_PULLUP);
+	palSetPadMode(HW_UART_RX_PORT, HW_UART_RX_PIN, PAL_MODE_ALTERNATE(HW_UART_GPIO_AF) |
+			PAL_STM32_OSPEED_HIGHEST |
+			PAL_STM32_PUDR_PULLUP);
+#ifdef HW_ADC_EXT_GPIO
+	palSetPadMode(HW_ADC_EXT_GPIO, HW_ADC_EXT_PIN, PAL_MODE_OUTPUT_PUSHPULL |
+			PAL_STM32_OSPEED_HIGHEST |
+			PAL_STM32_PUDR_PULLUP);
+#endif
+
+	for(;;) {
+		// Check if it is time to stop.
+		if (ts5700n8501_stop_now) {
+			ts5700n8501_is_running = false;
+			return;
+		}
+
+		TS5700N8501_send_byte(0b01000000);
+
+		chThdSleep(1);
+
+		uint8_t reply[6];
+		int reply_ind = 0;
+
+		msg_t res = sdGetTimeout(&HW_UART_DEV, TIME_IMMEDIATE);
+		while (res != MSG_TIMEOUT) {
+			if (reply_ind < (int)sizeof(reply)) {
+				reply[reply_ind++] = res;
+			}
+			res = sdGetTimeout(&HW_UART_DEV, TIME_IMMEDIATE);
+		}
+
+		uint8_t crc = 0;
+		for (int i = 0;i < (reply_ind - 1);i++) {
+			crc = (reply[i] ^ crc);
+		}
+
+		if (reply_ind == 6 && crc == reply[reply_ind - 1]) {
+			uint32_t pos = (uint32_t)reply[2] + ((uint32_t)reply[3] << 8) + ((uint32_t)reply[4] << 16);
+			last_enc_angle = (float)pos / 131072.0 * 360.0;
+			UTILS_LP_FAST(spi_error_rate, 0.0, 1.0 / AS5047_SAMPLE_RATE_HZ);
+		} else {
+			++spi_error_cnt;
+			UTILS_LP_FAST(spi_error_rate, 1.0, 1.0 / AS5047_SAMPLE_RATE_HZ);
+		}
+	}
+}
+

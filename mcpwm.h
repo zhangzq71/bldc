@@ -34,6 +34,7 @@ void mcpwm_set_pid_speed(float rpm);
 void mcpwm_set_pid_pos(float pos);
 void mcpwm_set_current(float current);
 void mcpwm_set_brake_current(float current);
+int mcpwm_set_tachometer_value(int steps);
 void mcpwm_brake_now(void);
 void mcpwm_release_motor(void);
 int mcpwm_get_comm_step(void);
@@ -66,6 +67,9 @@ float mcpwm_get_last_inj_adc_isr_duration(void);
 mc_rpm_dep_struct mcpwm_get_rpm_dep(void);
 bool mcpwm_is_dccal_done(void);
 void mcpwm_switch_comm_mode(mc_comm_mode next);
+
+void drv8323s_dccal_on(void);
+void drv8323s_dccal_off(void);
 
 // Interrupt handlers
 void mcpwm_adc_inj_int_handler(void);

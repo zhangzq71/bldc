@@ -18,9 +18,9 @@
  */
 
 #include "hw.h"
-#ifdef HW_HAS_DRV8320
+#ifdef HW_HAS_DRV8320S
 
-#include "drv8320.h"
+#include "drv8320s.h"
 #include "ch.h"
 #include "hal.h"
 #include "stm32f4xx_conf.h"
@@ -45,53 +45,53 @@ static void terminal_reset_faults(int argc, const char **argv);
 // Private variables
 static char m_fault_print_buffer[120];
 
-void drv8320_init(void) {
-	// DRV8320 SPI
-	palSetPadMode(DRV8320_MISO_GPIO, DRV8320_MISO_PIN, PAL_MODE_INPUT_PULLUP);
-	palSetPadMode(DRV8320_SCK_GPIO, DRV8320_SCK_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
-	palSetPadMode(DRV8320_CS_GPIO, DRV8320_CS_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
-	palSetPadMode(DRV8320_MOSI_GPIO, DRV8320_MOSI_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
-	palSetPad(DRV8320_MOSI_GPIO, DRV8320_MOSI_PIN);
+void drv8320s_init(void) {
+	// DRV8320S SPI
+	palSetPadMode(DRV8320S_MISO_GPIO, DRV8320S_MISO_PIN, PAL_MODE_INPUT_PULLUP);
+	palSetPadMode(DRV8320S_SCK_GPIO, DRV8320S_SCK_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
+	palSetPadMode(DRV8320S_CS_GPIO, DRV8320S_CS_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
+	palSetPadMode(DRV8320S_MOSI_GPIO, DRV8320S_MOSI_PIN, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
+	palSetPad(DRV8320S_MOSI_GPIO, DRV8320S_MOSI_PIN);
 
 	chThdSleepMilliseconds(100);
 
 	// Disable OC
-	drv8320_write_reg(5, 0x04C0);
-	drv8320_write_reg(5, 0x04C0);
+	drv8320s_write_reg(5, 0x04C0);
+	drv8320s_write_reg(5, 0x04C0);
 
 	terminal_register_command_callback(
-			"drv8320_read_reg",
-			"Read a register from the DRV8320 and print it.",
+			"drv8320s_read_reg",
+			"Read a register from the DRV8320S and print it.",
 			"[reg]",
 			terminal_read_reg);
 
 	terminal_register_command_callback(
-			"drv8320_write_reg",
-			"Write to a DRV8320 register.",
+			"drv8320s_write_reg",
+			"Write to a DRV8320S register.",
 			"[reg] [hexvalue]",
 			terminal_write_reg);
 
 	terminal_register_command_callback(
-			"drv8320_set_oc_adj",
-			"Set the DRV8320 OC ADJ register.",
+			"drv8320s_set_oc_adj",
+			"Set the DRV8320S OC ADJ register.",
 			"[value]",
 			terminal_set_oc_adj);
 
 	terminal_register_command_callback(
-			"drv8320_print_faults",
-			"Print all current DRV8320 faults.",
+			"drv8320s_print_faults",
+			"Print all current DRV8320S faults.",
 			0,
 			terminal_print_faults);
 
 	terminal_register_command_callback(
-			"drv8320_reset_faults",
-			"Reset all latched DRV8320 faults.",
+			"drv8320s_reset_faults",
+			"Reset all latched DRV8320S faults.",
 			0,
 			terminal_reset_faults);
 }
 
 /**
- * Set the threshold of the over current protection of the DRV8320. It works by measuring
+ * Set the threshold of the over current protection of the DRV8320S. It works by measuring
  * the voltage drop across drain-source of the MOSFETs and activates when it is higher than
  * a set value. Notice that this current limit is not very accurate.
  *
@@ -99,36 +99,36 @@ void drv8320_init(void) {
  * The value to use. Range [0 15]. A lower value corresponds to a lower current limit. See
  * the drv8320 datasheet for how to convert these values to currents.
  */
-void drv8320_set_oc_adj(int val) {
+void drv8320s_set_oc_adj(int val) {
 	// Match with the drv8301 levels
 	val >>= 1;
-	int reg = drv8320_read_reg(5);
+	int reg = drv8320s_read_reg(5);
 	reg &= 0xFFF0;
 	reg |= (val & 0xF);
-	drv8320_write_reg(5, reg);
+	drv8320s_write_reg(5, reg);
 }
 
 /**
- * Set the over current protection mode of the DRV8320.
+ * Set the over current protection mode of the DRV8320S.
  *
  * @param mode
  * The over current protection mode.
  */
-void drv8320_set_oc_mode(drv8301_oc_mode mode) {
+void drv8320s_set_oc_mode(drv8301_oc_mode mode) {
 	// Match with the drv8301 modes
 	if (mode == DRV8301_OC_LATCH_SHUTDOWN) {
 		mode = DRV8301_OC_LIMIT;
 	} else if (mode == DRV8301_OC_LIMIT) {
 		mode = DRV8301_OC_LATCH_SHUTDOWN;
 	}
-	int reg = drv8320_read_reg(5);
+	int reg = drv8320s_read_reg(5);
 	reg &= 0xFF3F;
 	reg |= (mode & 0x03) << 6;
-	drv8320_write_reg(5, reg);
+	drv8320s_write_reg(5, reg);
 }
 
 /**
- * Read the fault codes of the DRV8320.
+ * Read the fault codes of the DRV8320S.
  *
  * @return
  * The fault codes, where the bits represent the following:
@@ -146,112 +146,112 @@ void drv8320_set_oc_mode(drv8301_oc_mode mode) {
  * b11: GVDD_OV
  *
  */
-unsigned long drv8320_read_faults(void) {
-	unsigned long r0 = drv8320_read_reg(0);
-	int r1 = drv8320_read_reg(1);
+unsigned long drv8320s_read_faults(void) {
+	unsigned long r0 = drv8320s_read_reg(0);
+	int r1 = drv8320s_read_reg(1);
 	return r0 | (r1 << 16);
 }
 
 /**
  * Reset all latched faults.
  */
-void drv8320_reset_faults(void) {
-	int reg = drv8320_read_reg(2);
+void drv8320s_reset_faults(void) {
+	int reg = drv8320s_read_reg(2);
 	reg |= 1;
-	drv8320_write_reg(2, reg);
+	drv8320s_write_reg(2, reg);
 }
 
-char* drv8320_faults_to_string(unsigned long faults) {
+char* drv8320s_faults_to_string(unsigned long faults) {
 	if (faults == 0) {
-		strcpy(m_fault_print_buffer, "No DRV8320 faults");
+		strcpy(m_fault_print_buffer, "No DRV8320S faults");
 	} else {
 		strcpy(m_fault_print_buffer, "|");
 
-		if (faults & DRV8320_FAULT_FET_LC_OC) {
+		if (faults & DRV8320S_FAULT_FET_LC_OC) {
 			strcat(m_fault_print_buffer, " FETLC_OC |");
 		}
 
-		if (faults & DRV8320_FAULT_FET_HC_OC) {
+		if (faults & DRV8320S_FAULT_FET_HC_OC) {
 			strcat(m_fault_print_buffer, " FETHC_OC |");
 		}
 
-		if (faults & DRV8320_FAULT_FET_LB_OC) {
+		if (faults & DRV8320S_FAULT_FET_LB_OC) {
 			strcat(m_fault_print_buffer, " FETLB_OC |");
 		}
 
-		if (faults & DRV8320_FAULT_FET_HB_OC) {
+		if (faults & DRV8320S_FAULT_FET_HB_OC) {
 			strcat(m_fault_print_buffer, " FETHB_OC |");
 		}
 
-		if (faults & DRV8320_FAULT_FET_LA_OC) {
+		if (faults & DRV8320S_FAULT_FET_LA_OC) {
 			strcat(m_fault_print_buffer, " FETLA_OC |");
 		}
 
-		if (faults & DRV8320_FAULT_FET_HA_OC) {
+		if (faults & DRV8320S_FAULT_FET_HA_OC) {
 			strcat(m_fault_print_buffer, " FETHA_OC |");
 		}
 
-		if (faults & DRV8320_FAULT_OTSD) {
+		if (faults & DRV8320S_FAULT_OTSD) {
 			strcat(m_fault_print_buffer, " OTSD |");
 		}
 
-		if (faults & DRV8320_FAULT_UVLO) {
+		if (faults & DRV8320S_FAULT_UVLO) {
 			strcat(m_fault_print_buffer, " UVLO |");
 		}
 
-		if (faults & DRV8320_FAULT_GDF) {
+		if (faults & DRV8320S_FAULT_GDF) {
 			strcat(m_fault_print_buffer, " GDF |");
 		}
 
-		if (faults & DRV8320_FAULT_VDS_OCP) {
+		if (faults & DRV8320S_FAULT_VDS_OCP) {
 			strcat(m_fault_print_buffer, " VDS OCP |");
 		}
 
-		if (faults & DRV8320_FAULT_FAULT) {
+		if (faults & DRV8320S_FAULT_FAULT) {
 			strcat(m_fault_print_buffer, " FAULT |");
 		}
 
-		if (faults & DRV8320_FAULT_VGS_LC) {
+		if (faults & DRV8320S_FAULT_VGS_LC) {
 			strcat(m_fault_print_buffer, " FETLC VGS |");
 		}
 
-		if (faults & DRV8320_FAULT_VGS_HC) {
+		if (faults & DRV8320S_FAULT_VGS_HC) {
 			strcat(m_fault_print_buffer, " FETHC VGS |");
 		}
 
-		if (faults & DRV8320_FAULT_VGS_LB) {
+		if (faults & DRV8320S_FAULT_VGS_LB) {
 			strcat(m_fault_print_buffer, " FETLB VGS |");
 		}
 
-		if (faults & DRV8320_FAULT_VGS_HB) {
+		if (faults & DRV8320S_FAULT_VGS_HB) {
 			strcat(m_fault_print_buffer, " FETHB VGS |");
 		}
 
-		if (faults & DRV8320_FAULT_VGS_LA) {
+		if (faults & DRV8320S_FAULT_VGS_LA) {
 			strcat(m_fault_print_buffer, " FETLA VGS |");
 		}
 
-		if (faults & DRV8320_FAULT_VGS_HA) {
+		if (faults & DRV8320S_FAULT_VGS_HA) {
 			strcat(m_fault_print_buffer, " FETHA VGS |");
 		}
 
-		if (faults & DRV8320_FAULT_CPUV) {
+		if (faults & DRV8320S_FAULT_CPUV) {
 			strcat(m_fault_print_buffer, " CPU V |");
 		}
 
-		if (faults & DRV8320_FAULT_OTW) {
+		if (faults & DRV8320S_FAULT_OTW) {
 			strcat(m_fault_print_buffer, " OTW |");
 		}
 
-		if (faults & DRV8320_FAULT_SC_OC) {
+		if (faults & DRV8320S_FAULT_SC_OC) {
 			strcat(m_fault_print_buffer, " AMP C OC |");
 		}
 
-		if (faults & DRV8320_FAULT_SB_OC) {
+		if (faults & DRV8320S_FAULT_SB_OC) {
 			strcat(m_fault_print_buffer, " AMP B OC |");
 		}
 
-		if (faults & DRV8320_FAULT_SA_OC) {
+		if (faults & DRV8320S_FAULT_SA_OC) {
 			strcat(m_fault_print_buffer, " AMP A OC |");
 		}
 	}
@@ -259,7 +259,7 @@ char* drv8320_faults_to_string(unsigned long faults) {
 	return m_fault_print_buffer;
 }
 
-unsigned int drv8320_read_reg(int reg) {
+unsigned int drv8320s_read_reg(int reg) {
 	uint16_t out = 0;
 	out |= (1 << 15);
 	out |= (reg & 0x0F) << 11;
@@ -278,7 +278,7 @@ unsigned int drv8320_read_reg(int reg) {
 	return res;
 }
 
-void drv8320_write_reg(int reg, int data) {
+void drv8320s_write_reg(int reg, int data) {
 	uint16_t out = 0;
 	out |= (reg & 0x0F) << 11;
 	out |= data & 0x7FF;
@@ -301,20 +301,20 @@ static void spi_transfer(uint16_t *in_buf, const uint16_t *out_buf, int length) 
 		uint16_t receive = 0;
 
 		for (int bit = 0;bit < 16;bit++) {
-			palWritePad(DRV8320_MOSI_GPIO, DRV8320_MOSI_PIN, send >> 15);
+			palWritePad(DRV8320S_MOSI_GPIO, DRV8320S_MOSI_PIN, send >> 15);
 			send <<= 1;
 
-			palSetPad(DRV8320_SCK_GPIO, DRV8320_SCK_PIN);
+			palSetPad(DRV8320S_SCK_GPIO, DRV8320S_SCK_PIN);
 			spi_delay();
 
-			palClearPad(DRV8320_SCK_GPIO, DRV8320_SCK_PIN);
+			palClearPad(DRV8320S_SCK_GPIO, DRV8320S_SCK_PIN);
 
 			int r1, r2, r3;
-			r1 = palReadPad(DRV8320_MISO_GPIO, DRV8320_MISO_PIN);
+			r1 = palReadPad(DRV8320S_MISO_GPIO, DRV8320S_MISO_PIN);
 			__NOP();
-			r2 = palReadPad(DRV8320_MISO_GPIO, DRV8320_MISO_PIN);
+			r2 = palReadPad(DRV8320S_MISO_GPIO, DRV8320S_MISO_PIN);
 			__NOP();
-			r3 = palReadPad(DRV8320_MISO_GPIO, DRV8320_MISO_PIN);
+			r3 = palReadPad(DRV8320S_MISO_GPIO, DRV8320S_MISO_PIN);
 
 			receive <<= 1;
 			if (utils_middle_of_3_int(r1, r2, r3)) {
@@ -331,11 +331,11 @@ static void spi_transfer(uint16_t *in_buf, const uint16_t *out_buf, int length) 
 }
 
 static void spi_begin(void) {
-	palClearPad(DRV8320_CS_GPIO, DRV8320_CS_PIN);
+	palClearPad(DRV8320S_CS_GPIO, DRV8320S_CS_PIN);
 }
 
 static void spi_end(void) {
-	palSetPad(DRV8320_CS_GPIO, DRV8320_CS_PIN);
+	palSetPad(DRV8320S_CS_GPIO, DRV8320S_CS_PIN);
 }
 
 static void spi_delay(void) {
@@ -350,7 +350,7 @@ static void terminal_read_reg(int argc, const char **argv) {
 		sscanf(argv[1], "%d", &reg);
 
 		if (reg >= 0) {
-			unsigned int res = drv8320_read_reg(reg);
+			unsigned int res = drv8320s_read_reg(reg);
 			char bl[9];
 			char bh[9];
 
@@ -374,8 +374,8 @@ static void terminal_write_reg(int argc, const char **argv) {
 		sscanf(argv[2], "%x", &val);
 
 		if (reg >= 0 && val >= 0) {
-			drv8320_write_reg(reg, val);
-			unsigned int res = drv8320_read_reg(reg);
+			drv8320s_write_reg(reg, val);
+			unsigned int res = drv8320s_read_reg(reg);
 			char bl[9];
 			char bh[9];
 
@@ -397,8 +397,8 @@ static void terminal_set_oc_adj(int argc, const char **argv) {
 		sscanf(argv[1], "%d", &val);
 
 		if (val >= 0 && val < 32) {
-			drv8320_set_oc_adj(val);
-			unsigned int res = drv8320_read_reg(5);
+			drv8320s_set_oc_adj(val);
+			unsigned int res = drv8320s_read_reg(5);
 			char bl[9];
 			char bh[9];
 
@@ -417,13 +417,13 @@ static void terminal_set_oc_adj(int argc, const char **argv) {
 static void terminal_print_faults(int argc, const char **argv) {
 	(void)argc;
 	(void)argv;
-	commands_printf(drv8320_faults_to_string(drv8320_read_faults()));
+	commands_printf(drv8320s_faults_to_string(drv8320s_read_faults()));
 }
 
 static void terminal_reset_faults(int argc, const char **argv) {
 	(void)argc;
 	(void)argv;
-	drv8320_reset_faults();
+	drv8320s_reset_faults();
 }
 
 #endif
